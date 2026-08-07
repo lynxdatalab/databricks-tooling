@@ -1,0 +1,159 @@
+# Workflow reutilizable: valida un Databricks Asset Bundle sin desplegar nada.
+#
+# Se llama desde el CI de cada repo de lakehouse. Corre lint de Python, pruebas, el lint del
+# contrato de dominios (si el repo lo tiene) y `databricks bundle validate` contra los targets que
+# se le indiquen.
+#
+# NO despliega. La autenticación que usa es la de dev, y solo para que `bundle validate` pueda
+# resolver referencias del workspace: no hay ningún paso que escriba.
+#
+# Uso desde el repo llamador:
+#
+#   jobs:
+#     ci:
+#       uses: <org>/databricks-tooling/.github/workflows/bundle-ci.yml@v1
+#       permissions:
+#         id-token: write     # ← lo otorga el LLAMADOR, no este archivo
+#         contents: read
+#       with:
+#         targets: '["dev"]'
+
+name: bundle-ci
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: 'Targets del bundle a validar, como array JSON. Ej: ["dev","qa","prod"]'
+        type: string
+        default: '["dev"]'
+      python-version:
+        type: string
+        default: "3.11"
+      run-tests:
+        description: Corre pytest si el repo tiene tests/.
+        type: boolean
+        default: true
+      contract-lint:
+        description: >-
+          Comando del lint de contrato del repo. Vacío = se omite. Se ejecuta ANTES de bundle
+          validate porque un contrato inválido hace fallar el pipeline en tiempo de ejecución, no
+          en el deploy: es el error que más caro sale detectar tarde.
+        type: string
+        default: ""
+      environment:
+        description: >-
+          GitHub Environment del que salen DATABRICKS_HOST y DATABRICKS_CLIENT_ID. Debe ser uno
+          SIN protection rules (dev): el CI corre en cada push y no puede quedarse esperando una
+          aprobación.
+        type: string
+        default: dev
+      destructive-check:
+        description: >-
+          Comando del análisis de cambios destructivos. Vacío = se omite.
+
+          En un PR corre en modo `pr`: falla si el cambio borra recursos o deja tablas inactivas,
+          a menos que el PR lleve la etiqueta correspondiente. Es la única compuerta que existe
+          para el caso más frecuente —quitar tablas del pipeline— porque ese cambio NO le pide
+          permiso al CLI: las tablas simplemente dejan de actualizarse y nadie se entera.
+        type: string
+        default: "python tools/check_destructive.py"
+
+jobs:
+  destructivos:
+    name: cambios destructivos
+    # Solo en PRs: en un push a main el análisis lo hace el job `analizar` del deploy, que además
+    # publica el resumen que ven los revisores de qa y prod.
+    if: ${{ github.event_name == 'pull_request' && inputs.destructive-check != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Necesita la historia para leer el "antes" con `git show <base>:archivo`. Con
+          # fetch-depth: 1 el check no puede distinguir "no cambió nada" de "no pude ver el antes".
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f pyproject.toml ]; then pip install -e '.[dev]' || pip install pyyaml; else pip install pyyaml; fi
+
+      - name: Analizar contra la rama base
+        env:
+          # Las etiquetas del PR son la salida explícita: ponerlas deja constancia de que fue una
+          # decisión y no un descuido.
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          ${{ inputs.destructive-check }} \
+            --base "origin/${{ github.event.pull_request.base.ref }}" \
+            --mode pr \
+            --labels "$PR_LABELS" \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+
+  estatico:
+    name: lint + pruebas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f pyproject.toml ]; then
+            pip install -e '.[dev]'
+          else
+            pip install ruff pytest pyyaml
+          fi
+
+      - name: ruff
+        run: ruff check .
+
+      - name: pytest
+        if: inputs.run-tests
+        run: |
+          if [ -d tests ]; then
+            pytest -q
+          else
+            echo "Sin directorio tests/: se omite."
+          fi
+
+      - name: Lint del contrato
+        if: inputs.contract-lint != ''
+        run: ${{ inputs.contract-lint }}
+
+  bundle:
+    name: validate (${{ matrix.target }})
+    needs: estatico
+    runs-on: ubuntu-latest
+    # Toma HOST y CLIENT_ID del environment. Se declara aunque no se despliegue porque es de donde
+    # salen las variables y porque el claim `sub` del token OIDC tiene que coincidir con la
+    # federation policy del service principal.
+    environment: ${{ inputs.environment }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: databricks bundle validate
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+          # Sin DATABRICKS_CLIENT_SECRET: la CLI usa el token OIDC efímero que emite GitHub y que
+          # la federation policy del service principal canjea por acceso. No hay ningún secreto
+          # de larga vida en el repo ni en los settings.
+        run: databricks bundle validate -t ${{ matrix.target }}

@@ -1,0 +1,165 @@
+# Workflow reutilizable: despliega un Databricks Asset Bundle a UN target.
+#
+# Se llama una vez por ambiente desde el workflow de despliegue del repo, encadenando los jobs con
+# `needs:` para que la promoción sea dev → qa → prod. Las compuertas de aprobación NO viven aquí:
+# viven en las protection rules del GitHub Environment, que es donde el equipo puede cambiarlas sin
+# tocar código.
+#
+# ⚠️ El análisis de acciones destructivas NO va aquí, y no es un olvido: GitHub evalúa las
+# protection rules del environment ANTES de ejecutar un solo paso del job, así que un job con
+# `environment: qa` se detiene sin haber podido imprimir nada. El revisor no vería el análisis.
+# Por eso vive en bundle-analyze.yml, que corre sin environment y publica su resumen primero.
+#
+# Uso desde el repo llamador:
+#
+#   jobs:
+#     analizar:
+#       uses: <org>/databricks-tooling/.github/workflows/bundle-analyze.yml@v1
+#     dev:
+#       needs: analizar
+#       uses: <org>/databricks-tooling/.github/workflows/bundle-deploy.yml@v1
+#       permissions: { id-token: write, contents: read }
+#       with: { target: dev }
+
+name: bundle-deploy
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: Target del bundle. Debe existir un GitHub Environment con el mismo nombre.
+        type: string
+        required: true
+      python-version:
+        type: string
+        default: "3.11"
+      allow-destructive:
+        description: >-
+          Autoriza al CLI a ejecutar cambios que BORRAN datos: recrear un pipeline (cambio de
+          catalog/schema/publishing mode) o eliminarlo (clave renombrada, recurso quitado). Al
+          borrarse un pipeline se borran sus materialized views y streaming tables.
+
+          Default false, y en el push automático a main debe quedarse en false: nadie destruye
+          datos por hacer merge. Se activa solo desde workflow_dispatch, después de revisar el
+          resumen del job `analizar` de esa misma corrida.
+        type: boolean
+        default: false
+      dry-run:
+        description: >-
+          Valida y muestra el estado desplegado sin aplicar nada. Sirve para inspeccionar qué hay
+          hoy en un ambiente antes de tocarlo.
+        type: boolean
+        default: false
+    outputs:
+      commit:
+        description: SHA desplegado. Sirve para verificar que los tres ambientes corren el mismo.
+        value: ${{ jobs.deploy.outputs.commit }}
+
+jobs:
+  deploy:
+    # El nombre del job es lo que GitHub muestra en el DIÁLOGO DE APROBACIÓN del environment, antes
+    # de que el revisor abra nada. Marcarlo aquí es lo que hace que una aprobación destructiva no se
+    # pueda confundir con una rutinaria.
+    name: deploy ${{ inputs.target }}${{ inputs.allow-destructive && ' ⚠️ DESTRUCTIVO' || '' }}
+    runs-on: ubuntu-latest
+
+    # Aquí está el control de acceso real. El environment aporta tres cosas a la vez:
+    #   1. Sus protection rules (required reviewers, deployment branches) — el job SE DETIENE
+    #      esperando aprobación antes de correr un solo paso.
+    #   2. Las variables DATABRICKS_HOST y DATABRICKS_CLIENT_ID de ese ambiente.
+    #   3. El claim `sub = repo:{org}/{repo}:environment:{target}` del token OIDC, que es el único
+    #      que la federation policy del service principal de ese ambiente acepta.
+    # Las tres son independientes: saltarse una no basta para desplegar a prod.
+    environment: ${{ inputs.target }}
+
+    outputs:
+      commit: ${{ github.sha }}
+
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      # Sin DATABRICKS_CLIENT_SECRET: la CLI usa el token OIDC efímero que emite GitHub y que la
+      # federation policy del service principal canjea por acceso.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Verificar configuración del environment
+        # Un DATABRICKS_CLIENT_ID vacío hace que la CLI caiga a otro método de autenticación y
+        # falle mucho después con un error de credenciales que no dice que la variable faltaba.
+        run: |
+          : "${DATABRICKS_HOST:?falta la variable DATABRICKS_HOST en el GitHub Environment '${{ inputs.target }}'}"
+          : "${DATABRICKS_CLIENT_ID:?falta la variable DATABRICKS_CLIENT_ID en el GitHub Environment '${{ inputs.target }}'}"
+          echo "Desplegando ${{ github.sha }} a ${{ inputs.target }} ($DATABRICKS_HOST)"
+
+      - name: databricks bundle validate
+        run: databricks bundle validate -t ${{ inputs.target }}
+
+      - name: Estado desplegado antes del cambio
+        # `bundle summary` lista los recursos que hoy existen en el workspace para este target.
+        # No es un plan —el CLI no tiene `bundle plan`— pero es la foto del "antes", y queda en el
+        # log de la corrida para poder comparar si algo sale mal.
+        continue-on-error: true
+        run: |
+          databricks bundle summary -t ${{ inputs.target }} -o json > /tmp/antes.json || true
+          echo "Recursos desplegados actualmente:"
+          python -c "
+          import json, pathlib, sys
+          p = pathlib.Path('/tmp/antes.json')
+          if not p.stat().st_size:
+              print('  (ninguno: primer despliegue a este target)'); sys.exit()
+          d = json.loads(p.read_text()).get('resources', {})
+          for tipo, items in sorted(d.items()):
+              for clave in sorted(items):
+                  print(f'  {tipo}.{clave}')
+          " || echo "  (no se pudo leer el resumen)"
+
+      - name: databricks bundle deploy
+        if: ${{ !inputs.dry-run }}
+        # --auto-approve SOLO cuando alguien lo autorizó explícitamente. Sin él, el CLI intenta
+        # pedir confirmación para los cambios destructivos, no hay terminal que responda, y el job
+        # falla. Ese fail-closed es el diseño: el paso siguiente traduce el error.
+        run: |
+          databricks bundle deploy -t ${{ inputs.target }} \
+            ${{ inputs.allow-destructive && '--auto-approve' || '' }}
+
+      - name: El deploy requiere aprobar una acción destructiva
+        if: ${{ failure() && !inputs.allow-destructive }}
+        run: |
+          {
+            echo "### ⛔ Despliegue detenido a \`${{ inputs.target }}\`"
+            echo ""
+            echo "Es probable que el cambio **borre o recree recursos**, y este despliegue corre en"
+            echo "modo cerrado. Al recrearse un pipeline se borran sus materialized views y"
+            echo "streaming tables."
+            echo ""
+            echo "**Qué hacer:**"
+            echo ""
+            echo "1. Revisa el resumen del job \`analizar\` de esta misma corrida: dice exactamente"
+            echo "   qué se destruiría."
+            echo "2. Si NO era la intención, revisa \`docs/acciones-destructivas.md\` — casi siempre"
+            echo "   hay una maniobra que evita destruir (\`bundle deployment bind\` para renombrar"
+            echo "   sin recrear, \`ALTER ... pipelines.pipelineId\` para mover tablas)."
+            echo "3. Si SÍ era la intención, relanza el workflow \`deploy\` con **Run workflow** y"
+            echo "   marca \`allow-destructive\`."
+            echo ""
+            echo "> Si el error de arriba no menciona aprobación ni recreación, el fallo es otro:"
+            echo "> revisa el log del paso \`databricks bundle deploy\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::El despliegue puede requerir aprobar una acción destructiva. Ver el resumen de la corrida."
+
+      - name: Resumen
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### Deploy a \`${{ inputs.target }}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Workspace | ${{ vars.DATABRICKS_HOST }} |"
+            echo "| Modo | ${{ inputs.dry-run && 'dry-run (sin aplicar)' || 'aplicado' }} |"
+            echo "| Destructivos | ${{ inputs.allow-destructive && '⚠️ AUTORIZADOS' || 'bloqueados' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
