@@ -59,19 +59,25 @@ on:
       bundle-vars:
         description: >-
           Variables del bundle que no viven en databricks.yml, una por línea, en formato
-          `nombre=valor`. Se exportan como BUNDLE_VAR_<nombre>, que es como el CLI las lee.
+          `variable_del_bundle=NOMBRE_DE_LA_VARIABLE_DE_GITHUB`. Se exportan como
+          BUNDLE_VAR_<variable_del_bundle>, que es como el CLI las lee.
 
-          Existe porque hay valores de OPERACIÓN —el correo de alertas es el caso— que cambian sin
-          que cambie el repo, y que por eso se declaran sin default: un default vacío produce un
-          lote que falla de madrugada sin que nadie se entere. Sin un canal para pasarlos, el
-          `bundle validate` del CI falla con "no value assigned to required variable".
+          Hace falta para toda variable declarada SIN default: sin ella, `bundle validate` falla
+          con "no value assigned to required variable". El caso típico es el correo de alertas, un
+          dato de operación que cambia sin que cambie el repo, y que no tiene default a propósito
+          porque un default vacío produce un lote que falla de madrugada sin que nadie se entere.
 
-          El mapeo es explícito y no automático porque GitHub guarda los nombres de sus variables
-          en MAYÚSCULAS, y las variables del bundle son sensibles a mayúsculas: una copia directa
+          Se mandan NOMBRES y no valores porque el llamador no puede resolverlos: las variables de
+          un GitHub Environment solo existen en el contexto `vars` de un job que declare ese
+          environment, y quien lo declara es este workflow. Un `vars.X` escrito en el llamador se
+          evalúa contra las variables del repo y llega vacío, sin error.
+
+          El nombre del bundle se escribe aparte del de GitHub porque GitHub guarda los suyos en
+          MAYÚSCULAS y las variables del bundle distinguen mayúsculas: copiarlas tal cual
           exportaría BUNDLE_VAR_NOTIFICATION_EMAIL, que el CLI no reconoce.
 
-          El llamador escribe una línea por variable, con el valor interpolado desde el contexto
-          `vars` de su GitHub Environment. Ver el README.
+              bundle-vars: |
+                notification_email=NOTIFICATION_EMAIL
         type: string
         default: ""
     outputs:
@@ -102,6 +108,10 @@ jobs:
     env:
       DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
       DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      # Explícito, no por descubrimiento: con solo HOST y CLIENT_ID el CLI recorre su cadena de
+      # credenciales, no encuentra ninguna completa y muere con "cannot configure default
+      # credentials", sin mencionar que el token OIDC de GitHub estaba ahí para usarse.
+      DATABRICKS_AUTH_TYPE: github-oidc
       # Sin DATABRICKS_CLIENT_SECRET: la CLI usa el token OIDC efímero que emite GitHub y que la
       # federation policy del service principal canjea por acceso.
 
@@ -125,29 +135,48 @@ jobs:
           : "${DATABRICKS_CLIENT_ID:?falta la variable DATABRICKS_CLIENT_ID en el GitHub Environment '${{ inputs.target }}'}"
           echo "Desplegando ${{ github.sha }} a ${{ inputs.target }} ($DATABRICKS_HOST)"
 
-      # Se exportan al entorno del job (GITHUB_ENV) y no en cada `run:` porque las consumen tres
-      # pasos distintos: validate, summary y deploy. Que uno las tuviera y otro no produciría un
-      # validate en verde seguido de un deploy que falla por una variable sin valor.
+      # El llamador NO puede resolver estos valores. Las variables de un GitHub Environment solo
+      # existen en el contexto `vars` de un job que declare ese environment, y quien lo declara es
+      # ESTE workflow, no el que lo invoca: un `${{ vars.X }}` escrito allá se evalúa contra las
+      # variables del repo y llega vacío, sin error. Por eso el llamador manda NOMBRES y la
+      # resolución ocurre aquí.
+      #
+      # Se exporta a GITHUB_ENV y no dentro de un solo `run:` porque los valores los consumen
+      # varios pasos; tenerlos en uno solo daría un validate verde seguido de un deploy que falla.
       - name: Exportar variables del bundle
         if: inputs.bundle-vars != ''
         env:
           BUNDLE_VARS: ${{ inputs.bundle-vars }}
+          VARS_JSON: ${{ toJSON(vars) }}
         run: |
-          set -euo pipefail
-          while IFS= read -r linea; do
-            [ -z "${linea// }" ] && continue
-            case "$linea" in \#*) continue ;; esac
-            nombre=${linea%%=*}
-            valor=${linea#*=}
-            nombre=$(printf '%s' "$nombre" | tr -d '[:space:]')
-            if [ -z "$nombre" ] || [ "$nombre" = "$linea" ]; then
-              echo "::error::bundle-vars: '$linea' no tiene forma nombre=valor" && exit 1
-            fi
-            # El valor NO se recorta ni se imprime: puede traer espacios significativos, y un
-            # echo aquí lo dejaría en el log de una corrida pública.
-            printf 'BUNDLE_VAR_%s=%s\n' "$nombre" "$valor" >> "$GITHUB_ENV"
-            echo "  BUNDLE_VAR_$nombre exportada"
-          done <<< "$BUNDLE_VARS"
+          python3 - <<'PY'
+          import json, os, sys
+
+          disponibles = json.loads(os.environ["VARS_JSON"])
+          destino = os.environ["GITHUB_ENV"]
+
+          with open(destino, "a", encoding="utf-8") as fh:
+              for cruda in os.environ["BUNDLE_VARS"].splitlines():
+                  linea = cruda.strip()
+                  if not linea or linea.startswith("#"):
+                      continue
+                  if "=" not in linea:
+                      sys.exit(f"::error::bundle-vars: '{linea}' no tiene forma "
+                               "variable_del_bundle=NOMBRE_DE_LA_VARIABLE_DE_GITHUB")
+                  var_bundle, var_github = (p.strip() for p in linea.split("=", 1))
+                  if var_github not in disponibles:
+                      sys.exit(f"::error::bundle-vars: no existe una variable '{var_github}'. "
+                               "Revisa Settings > Environments del repo que invoca este workflow.")
+                  valor = disponibles[var_github]
+                  if not valor:
+                      sys.exit(f"::error::bundle-vars: la variable '{var_github}' está vacía, y "
+                               f"'{var_bundle}' no tiene default en databricks.yml.")
+                  if "\n" in valor:
+                      sys.exit(f"::error::bundle-vars: '{var_github}' tiene saltos de línea.")
+                  # El valor no se imprime: el log de una corrida puede ser público.
+                  fh.write(f"BUNDLE_VAR_{var_bundle}={valor}\n")
+                  print(f"  BUNDLE_VAR_{var_bundle} <- {var_github}")
+          PY
 
       - name: databricks bundle validate
         run: databricks bundle validate -t ${{ inputs.target }}
