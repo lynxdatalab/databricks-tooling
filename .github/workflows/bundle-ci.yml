@@ -45,6 +45,20 @@ on:
           en el deploy: es el error que más caro sale detectar tarde.
         type: string
         default: ""
+      bundle-vars:
+        description: >-
+          Variables del bundle que no viven en databricks.yml, una por línea, en formato
+          `nombre=valor`. Se exportan como BUNDLE_VAR_<nombre>, que es como el CLI las lee.
+
+          Hace falta para toda variable declarada SIN default: sin ella, `bundle validate` falla
+          con "no value assigned to required variable" en el CI de cada PR. El caso típico es el
+          correo de alertas, que es un dato de operación y cambia sin que cambie el repo.
+
+          El mapeo es explícito porque GitHub guarda los nombres de sus variables en MAYÚSCULAS y
+          las del bundle distinguen mayúsculas: una copia directa exportaría
+          BUNDLE_VAR_NOTIFICATION_EMAIL, que el CLI no reconoce.
+        type: string
+        default: ""
       environment:
         description: >-
           GitHub Environment del que salen DATABRICKS_HOST y DATABRICKS_CLIENT_ID. Debe ser uno
@@ -165,6 +179,28 @@ jobs:
 
       # Fijo, no @main: es la misma regla que este repo le impone a sus consumidores.
       - uses: databricks/setup-cli@v1.11.0
+
+      # Mismo mecanismo que en bundle-deploy: las variables del bundle que no tienen default hay
+      # que pasarlas, o `bundle validate` falla con "no value assigned to required variable" — y
+      # fallaría en el CI de cada PR, no solo al desplegar.
+      - name: Exportar variables del bundle
+        if: inputs.bundle-vars != ''
+        env:
+          BUNDLE_VARS: ${{ inputs.bundle-vars }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r linea; do
+            [ -z "${linea// }" ] && continue
+            case "$linea" in \#*) continue ;; esac
+            nombre=${linea%%=*}
+            valor=${linea#*=}
+            nombre=$(printf '%s' "$nombre" | tr -d '[:space:]')
+            if [ -z "$nombre" ] || [ "$nombre" = "$linea" ]; then
+              echo "::error::bundle-vars: '$linea' no tiene forma nombre=valor" && exit 1
+            fi
+            printf 'BUNDLE_VAR_%s=%s\n' "$nombre" "$valor" >> "$GITHUB_ENV"
+            echo "  BUNDLE_VAR_$nombre exportada"
+          done <<< "$BUNDLE_VARS"
 
       - name: databricks bundle validate
         env:
