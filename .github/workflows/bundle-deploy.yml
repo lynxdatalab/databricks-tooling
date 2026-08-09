@@ -33,6 +33,12 @@ on:
       python-version:
         type: string
         default: "3.11"
+      docs:
+        description: >-
+          Dónde documenta este repo las alternativas a destruir. Se cita en el mensaje de fallo.
+          Este workflow no puede saber el layout de docs del consumidor.
+        type: string
+        default: "la documentación de acciones destructivas del repo"
       allow-destructive:
         description: >-
           Autoriza al CLI a ejecutar cambios que BORRAN datos: recrear un pipeline (cambio de
@@ -84,7 +90,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: databricks/setup-cli@main
+      # Fijo, no @main: es la misma regla que este repo le impone a sus consumidores.
+      - uses: databricks/setup-cli@v1.11.0
+
+      # Lo usa el resumen del estado desplegado. Sin esto, `python-version` era un input muerto que
+      # se leía como configurado.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
 
       - name: Verificar configuración del environment
         # Un DATABRICKS_CLIENT_ID vacío hace que la CLI caiga a otro método de autenticación y
@@ -117,6 +130,7 @@ jobs:
           " || echo "  (no se pudo leer el resumen)"
 
       - name: databricks bundle deploy
+        id: deploy
         if: ${{ !inputs.dry-run }}
         # --auto-approve SOLO cuando alguien lo autorizó explícitamente. Sin él, el CLI intenta
         # pedir confirmación para los cambios destructivos, no hay terminal que responda, y el job
@@ -126,7 +140,12 @@ jobs:
             ${{ inputs.allow-destructive && '--auto-approve' || '' }}
 
       - name: El deploy requiere aprobar una acción destructiva
-        if: ${{ failure() && !inputs.allow-destructive }}
+        # Acotado al paso del deploy: con `failure()` a secas, un fallo de red, de checkout o de
+        # `bundle validate` producía este mismo mensaje y mandaba a buscar una destrucción que no
+        # existía.
+        # `failure()` va al frente a propósito: sin una función de estado en la expresión, GitHub
+        # aplica `success()` implícito y el paso se omitiría justo cuando hace falta.
+        if: ${{ failure() && steps.deploy.outcome == 'failure' && !inputs.allow-destructive }}
         run: |
           {
             echo "### ⛔ Despliegue detenido a \`${{ inputs.target }}\`"
@@ -139,7 +158,7 @@ jobs:
             echo ""
             echo "1. Revisa el resumen del job \`analizar\` de esta misma corrida: dice exactamente"
             echo "   qué se destruiría."
-            echo "2. Si NO era la intención, revisa \`docs/acciones-destructivas.md\` — casi siempre"
+            echo "2. Si NO era la intención, revisa ${{ inputs.docs }} — casi siempre"
             echo "   hay una maniobra que evita destruir (\`bundle deployment bind\` para renombrar"
             echo "   sin recrear, \`ALTER ... pipelines.pipelineId\` para mover tablas)."
             echo "3. Si SÍ era la intención, relanza el workflow \`deploy\` con **Run workflow** y"

@@ -1,0 +1,101 @@
+# CI de ESTE repo.
+#
+# Existía un hueco incómodo: los workflows de aquí se publican con un tag móvil `v1` que todos los
+# repos de lakehouse siguen, pero nada los probaba. La única forma de enterarse de que un cambio
+# rompía algo era que fallara el deploy a producción de un proyecto que nadie estaba mirando.
+#
+# Las compuertas son código con pruebas, así que aquí se prueban como código.
+
+name: self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pruebas:
+    name: lint + pruebas (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Las dos puntas del rango que declara pyproject. El CI de los repos consumidores corre con
+        # `python-version` configurable, así que romper una de las dos rompe a alguien.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Instalar
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: ruff
+        run: ruff check .
+
+      - name: pytest
+        # Las pruebas crean repos git de verdad para poder comparar contra una revisión base.
+        run: |
+          set -euo pipefail
+          git config --global user.email "ci@example.com"
+          git config --global user.name "ci"
+          pytest -q
+
+      - name: Los ejecutables quedaron instalados
+        # Si un entry point se rompe, el fallo aparecería en el CI de los consumidores como un
+        # "command not found" sin relación aparente con este repo.
+        run: |
+          set -euo pipefail
+          check-destructive --help > /dev/null
+          gen-tables-lock --help > /dev/null
+
+  workflows:
+    name: los workflows son YAML válido
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parsear cada workflow y verificar que declara workflow_call
+        # Un error de sintaxis aquí no se descubre al mezclar: se descubre cuando un repo
+        # consumidor lo llama y GitHub le contesta con un error que apunta a ESTE archivo.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          fallos = []
+          for archivo in sorted(Path(".github/workflows").glob("*.yml")):
+              try:
+                  datos = yaml.safe_load(archivo.read_text(encoding="utf-8"))
+              except yaml.YAMLError as exc:
+                  fallos.append(f"{archivo}: YAML inválido: {exc}")
+                  continue
+
+              # `on` es la constante YAML `true` en YAML 1.1, que es lo que usa PyYAML.
+              disparadores = datos.get("on") or datos.get(True) or {}
+              if archivo.name.startswith("bundle-") and "workflow_call" not in disparadores:
+                  fallos.append(f"{archivo}: es reutilizable pero no declara workflow_call")
+              print(f"ok  {archivo}  ({', '.join(disparadores)})")
+
+          if fallos:
+              print("\n".join(fallos), file=sys.stderr)
+              sys.exit(1)
+          PY

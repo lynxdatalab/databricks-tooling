@@ -26,8 +26,10 @@ on:
         description: >-
           Comando del análisis del repo. Debe aceptar --base, --mode, --summary-file y
           --output-file. Vacío = se omite el análisis (el proyecto todavía no lo tiene).
+
+          El default es el ejecutable que instala `lakehouse-tooling`.
         type: string
-        default: "python tools/check_destructive.py"
+        default: "check-destructive"
       python-version:
         type: string
         default: "3.11"
@@ -63,16 +65,48 @@ jobs:
 
       - name: Instalar dependencias
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f pyproject.toml ]; then pip install -e '.[dev]' || pip install pyyaml; else pip install pyyaml; fi
+          # Sin `|| pip install pyyaml`: ese fallback convertía un pyproject roto en una corrida
+          # verde que analizaba con las herramientas equivocadas.
+          if [ -f pyproject.toml ]; then
+            pip install -e '.[dev]'
+          else
+            pip install lakehouse-tooling
+          fi
+
+      # Resolver la base es un paso aparte porque tiene tres casos y uno de ellos no es un error.
+      #
+      # El que muerde: cuando un push CREA la rama, GitHub manda `before` = 40 ceros. No es cadena
+      # vacía, así que un `||` lo da por bueno, y el fallo aparece después, dentro del análisis,
+      # como "no se pudo resolver la revisión base 0000..." — un mensaje que no se parece en nada a
+      # su causa. En un repo recién publicado eso deja rojo el primer deploy y, por `needs:`, deja
+      # dev/qa/prod en skipped.
+      - name: Resolver la revisión base
+        id: base
+        env:
+          BASE_INPUT: ${{ inputs.base-ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          SHA_NULO=0000000000000000000000000000000000000000
+          if [ -n "$BASE_INPUT" ]; then
+            BASE="$BASE_INPUT"
+          elif [ -n "$EVENT_BEFORE" ] && [ "$EVENT_BEFORE" != "$SHA_NULO" ]; then
+            BASE="$EVENT_BEFORE"
+          elif git rev-parse --verify -q 'HEAD~1^{commit}' >/dev/null; then
+            BASE=HEAD~1
+          else
+            # Primer commit del repositorio: no existe un "antes". No es un error a depurar.
+            BASE=""
+          fi
+          echo "ref=$BASE" >> "$GITHUB_OUTPUT"
 
       - name: Analizar
         id: check
-        if: inputs.check-command != ''
+        if: inputs.check-command != '' && steps.base.outputs.ref != ''
         env:
-          # En un push a main, el "antes" es el commit anterior. En workflow_dispatch no hay evento
-          # previo, así que se cae a HEAD~1, que es lo mismo salvo en el primer commit del repo.
-          BASE_REF: ${{ inputs.base-ref || github.event.before || 'HEAD~1' }}
+          BASE_REF: ${{ steps.base.outputs.ref }}
         run: |
           set -euo pipefail
           ${{ inputs.check-command }} \
@@ -80,6 +114,17 @@ jobs:
             --mode report \
             --summary-file "$GITHUB_STEP_SUMMARY" \
             --output-file "$GITHUB_OUTPUT"
+
+      - name: Sin revisión previa
+        if: inputs.check-command != '' && steps.base.outputs.ref == ''
+        run: |
+          {
+            echo "### Análisis de cambios: sin revisión previa"
+            echo ""
+            echo "Este es el primer commit del repositorio, así que no hay un estado anterior"
+            echo "contra el cual comparar. **Todo es nuevo**: por construcción, este despliegue"
+            echo "no puede destruir ni dejar huérfano nada."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sin análisis configurado
         if: inputs.check-command == ''
@@ -90,7 +135,8 @@ jobs:
             echo "Este repo no declara \`check-command\`, así que **no se verificó** si el"
             echo "despliegue destruye recursos o deja tablas inactivas."
             echo ""
-            echo "Para activarlo, copia \`tools/check_destructive.py\` desde el template."
+            echo "Para activarlo, agrega \`lakehouse-tooling\` a las dependencias de desarrollo"
+            echo "del repo y pasa \`check-command: check-destructive\`."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "destructive=false" >> "$GITHUB_OUTPUT"
           echo "orphaned=false" >> "$GITHUB_OUTPUT"

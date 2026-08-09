@@ -34,6 +34,10 @@ on:
         description: Corre pytest si el repo tiene tests/.
         type: boolean
         default: true
+      run-lint:
+        description: Corre `ruff check .`. Se puede apagar en un repo que aún no está limpio.
+        type: boolean
+        default: true
       contract-lint:
         description: >-
           Comando del lint de contrato del repo. Vacío = se omite. Se ejecuta ANTES de bundle
@@ -56,8 +60,11 @@ on:
           a menos que el PR lleve la etiqueta correspondiente. Es la única compuerta que existe
           para el caso más frecuente —quitar tablas del pipeline— porque ese cambio NO le pide
           permiso al CLI: las tablas simplemente dejan de actualizarse y nadie se entera.
+
+          El default es el ejecutable que instala `lakehouse-tooling`. Un repo que aún no lo use
+          puede pasar aquí la ruta de su propio script.
         type: string
-        default: "python tools/check_destructive.py"
+        default: "check-destructive"
 
 jobs:
   destructivos:
@@ -80,8 +87,15 @@ jobs:
 
       - name: Instalar dependencias
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f pyproject.toml ]; then pip install -e '.[dev]' || pip install pyyaml; else pip install pyyaml; fi
+          # Sin `|| pip install pyyaml`: ese fallback convertía un pyproject roto en una corrida
+          # verde que analizaba con las herramientas equivocadas.
+          if [ -f pyproject.toml ]; then
+            pip install -e '.[dev]'
+          else
+            pip install lakehouse-tooling
+          fi
 
       - name: Analizar contra la rama base
         env:
@@ -109,14 +123,16 @@ jobs:
 
       - name: Instalar dependencias
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f pyproject.toml ]; then
             pip install -e '.[dev]'
           else
-            pip install ruff pytest pyyaml
+            pip install ruff pytest lakehouse-tooling
           fi
 
       - name: ruff
+        if: inputs.run-lint
         run: ruff check .
 
       - name: pytest
@@ -147,7 +163,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: databricks/setup-cli@main
+      # Fijo, no @main: es la misma regla que este repo le impone a sus consumidores.
+      - uses: databricks/setup-cli@v1.11.0
 
       - name: databricks bundle validate
         env:

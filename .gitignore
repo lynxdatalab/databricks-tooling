@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Instrucciones y configuración de herramientas de IA: no van a git.
+CLAUDE.md
+.claude/
+
+.env
+.DS_Store
