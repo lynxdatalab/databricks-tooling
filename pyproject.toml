@@ -21,6 +21,7 @@ dev = [
 check-destructive = "lakehouse_tooling.check_destructive:main"
 gen-tables-lock = "lakehouse_tooling.tables_lock:main"
 set-github-org = "lakehouse_tooling.github_org:main"
+check-schemas = "lakehouse_tooling.esquemas:main"
 
 [build-system]
 requires = ["hatchling"]

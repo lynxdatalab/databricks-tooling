@@ -31,6 +31,7 @@ desplegar vive aquí una sola vez.
 | `check-destructive` | Compara declaraciones contra otra revisión de git y reporta lo que destruye datos. Es la compuerta. |
 | `gen-tables-lock` | Genera y verifica `tables.lock`, el inventario versionado de las tablas que el repo materializa. |
 | `set-github-org` | Declara y propaga la organización de GitHub del repo, y verifica que nadie se quedó atrás. |
+| `check-schemas` | Falla si el repo declara tablas —o retiros— fuera de los esquemas que le corresponden. |
 
 Ninguno necesita credenciales ni cluster: leen archivos del repo y el historial de git.
 
@@ -119,6 +120,33 @@ jobs:
     permissions: { id-token: write, contents: read }
     with: { target: qa }
 ```
+
+#### `check-schemas`, o por qué los grants no bastan
+
+Los grants acotan lo que puede escribir una **persona**, no lo que escribe su **código**. El
+pipeline no corre con la identidad de quien lo programó: corre con la del service principal, que
+tiene permisos sobre todo el catálogo de su ambiente. Es un *confused deputy* — al desarrollador no
+le hacen falta permisos, le basta con que el SP los tenga.
+
+Así que un repo puede materializar una tabla dentro del esquema de otro proyecto sin encontrarse
+ningún obstáculo, y sin que nadie se entere hasta que aparece en el catálogo equivocado.
+
+```toml
+[tool.lakehouse-tooling]
+allowed_schemas  = ["ventas"]                             # lista literal
+schemas_provider = "mipaquete.contract:listar_esquemas"   # o dinámico, para repos multi-área
+```
+
+Sin ninguna de las dos la comprobación se omite: un repo que no declara sus esquemas no está
+diciendo "todos", está diciendo "todavía no lo he pensado".
+
+**También mira los retiros**, y es la parte que más importa: un `retire:` sobre una tabla ajena no
+la deja inactiva, hace que el job la **borre**. Es la única operación del sistema que destruye
+datos y sería la más fácil de dirigir al sitio equivocado.
+
+**Lo que no cubre:** es una comprobación sobre lo DECLARADO. Un nombre construido en tiempo de
+ejecución se le escapa, y sin revisión obligatoria de PR toda compuerta a nivel de código es un
+aviso y no un muro. Lo único no evadible son los grants de la identidad que ejecuta.
 
 ## `tables.lock`, y el cambio que nadie detecta
 
