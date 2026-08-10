@@ -23,10 +23,14 @@ TAMBIÉN MIRA LOS RETIROS, y esa es la parte que más importa. Un `retire:` sobr
 esquema no la deja inactiva: hace que el job la **borre**. Es la única operación del sistema que
 destruye datos, y sería la más fácil de dirigir al sitio equivocado.
 
-LO QUE NO CUBRE: es una comprobación sobre lo DECLARADO. Un nombre construido en tiempo de
-ejecución, o un `spark.sql("INSERT INTO otro.esquema...")` dentro del cuerpo de un pipeline, se le
-escapan. Sin revisión obligatoria de PR, toda compuerta a nivel de código es un aviso, no un muro:
-lo único no evadible son los grants de la identidad que ejecuta.
+DOS PASADAS. La primera mira lo que el repo DECLARA. La segunda mira lo que el código HACE: un
+`saveAsTable("otro.esquema.t")` o un `spark.sql("INSERT INTO ...")` dentro del cuerpo de un
+pipeline escriben donde digan, y eso no aparece en `tables.lock`.
+
+LO QUE NO CUBRE: un destino construido en tiempo de ejecución no se puede resolver leyendo el
+código. Se reporta como AVISO —para que se vea en el PR— pero no falla, porque a veces es legítimo.
+Y sin revisión obligatoria de PR, toda compuerta a nivel de código es un aviso y no un muro: lo
+único no evadible son los grants de la identidad que ejecuta.
 
 Uso:
     check-schemas
@@ -35,11 +39,34 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import ast
+import re
 import sys
 from pathlib import Path
 
-from .proyecto import ErrorDeProyecto, cargar_proveedor, leer_configuracion, resolver_raiz
+from .proyecto import (
+    ErrorDeProyecto,
+    cargar_proveedor,
+    leer_configuracion,
+    leer_pipelines,
+    resolver_raiz,
+)
 from .tables_lock import _descubrir
+
+#: Métodos del DataFrameWriter que escriben una tabla con nombre. `@dlt.table` no está aquí porque
+#: eso ya lo cubre la comprobación de lo declarado: publica en el esquema del recurso, no en uno
+#: arbitrario.
+ESCRITURAS_METODO = {"saveAsTable", "insertInto"}
+
+#: SQL que escribe. No están SELECT ni las lecturas: leer otro esquema suele ser legítimo —es para
+#: lo que existe un lakehouse— y la restricción de lectura vive en los grants, no aquí.
+SQL_ESCRITURA = re.compile(
+    r"\b(INSERT\s+INTO|INSERT\s+OVERWRITE(?:\s+TABLE)?|CREATE\s+(?:OR\s+REPLACE\s+)?"
+    r"(?:EXTERNAL\s+)?(?:TABLE|VIEW)(?:\s+IF\s+NOT\s+EXISTS)?|MERGE\s+INTO|UPDATE|"
+    r"DELETE\s+FROM|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE\s+TABLE|ALTER\s+TABLE)"
+    r"\s+([A-Za-z0-9_.`{}]+)",
+    re.IGNORECASE,
+)
 
 
 def esquemas_permitidos(raiz: Path) -> set[str] | None:
@@ -76,6 +103,96 @@ def _declaradas(raiz: Path) -> list[tuple[str, str]]:
         declaradas += [(str(n), "RETIRA (borra)") for n in retiradas()]
 
     return sorted(set(declaradas))
+
+
+def _esquema_de_destino(destino: str) -> str | None:
+    """El esquema al que apunta un destino de escritura, o None si no se puede saber.
+
+    Un nombre sin punto es una tabla del esquema propio del pipeline: no dice nada de otro esquema
+    y no se reporta. Con dos partes el esquema es la primera; con tres, la segunda.
+    """
+    limpio = destino.strip().strip("`").replace("`", "")
+    if "{" in limpio or "}" in limpio:
+        # Un nombre interpolado: no se puede resolver leyendo el código.
+        return None
+    partes = [p for p in limpio.split(".") if p]
+    if len(partes) == 2:
+        return partes[0]
+    if len(partes) >= 3:
+        return partes[1]
+    return None
+
+
+def _escrituras_de_archivo(ruta: Path) -> tuple[list[tuple[int, str, str]], list[tuple[int, str]]]:
+    """([(línea, destino, cómo)], [(línea, cómo)] dinámicas) de un archivo de pipeline."""
+    texto = ruta.read_text(encoding="utf-8")
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        # Un archivo que no compila no es asunto de esta compuerta: ruff y pytest lo dirán mejor.
+        return [], []
+
+    concretas: list[tuple[int, str, str]] = []
+    dinamicas: list[tuple[int, str]] = []
+
+    for nodo in ast.walk(arbol):
+        # df.write.saveAsTable("...") / .insertInto("...")
+        if isinstance(nodo, ast.Call) and isinstance(nodo.func, ast.Attribute):
+            if nodo.func.attr in ESCRITURAS_METODO:
+                if nodo.args and isinstance(nodo.args[0], ast.Constant):
+                    if isinstance(nodo.args[0].value, str):
+                        concretas.append((nodo.lineno, nodo.args[0].value, nodo.func.attr))
+                        continue
+                dinamicas.append((nodo.lineno, nodo.func.attr))
+
+        # SQL en una cadena literal. Las f-strings llegan como JoinedStr y sus trozos constantes
+        # se ven aquí sueltos, así que un destino interpolado no produce una coincidencia
+        # resoluble — se reporta como dinámico más abajo.
+        if isinstance(nodo, ast.Constant) and isinstance(nodo.value, str):
+            for verbo, destino in SQL_ESCRITURA.findall(nodo.value):
+                concretas.append((nodo.lineno, destino, " ".join(verbo.split()).upper()))
+
+        if isinstance(nodo, ast.JoinedStr):
+            literal = "".join(
+                v.value
+                for v in nodo.values
+                if isinstance(v, ast.Constant) and isinstance(v.value, str)
+            )
+            for verbo, _destino in SQL_ESCRITURA.findall(literal):
+                dinamicas.append((nodo.lineno, " ".join(verbo.split()).upper()))
+
+    return concretas, dinamicas
+
+
+def _revisar_codigo(raiz: Path, permitidos: set[str]) -> tuple[list[str], list[str]]:
+    """(errores, avisos) del escaneo de escrituras en los archivos de los pipelines."""
+    errores: list[str] = []
+    avisos: list[str] = []
+
+    try:
+        pipelines = leer_pipelines(raiz)
+    except ErrorDeProyecto:
+        # Sin resources/ legibles no hay nada que escanear; el resto del tooling ya se queja.
+        return [], []
+
+    vistos: set[Path] = set()
+    for pipeline in pipelines:
+        for archivo in pipeline.archivos:
+            if archivo in vistos or not archivo.is_file():
+                continue
+            vistos.add(archivo)
+            concretas, dinamicas = _escrituras_de_archivo(archivo)
+            rel = archivo.relative_to(raiz) if archivo.is_relative_to(raiz) else archivo
+
+            for linea, destino, como in concretas:
+                esquema = _esquema_de_destino(destino)
+                if esquema is not None and esquema not in permitidos:
+                    errores.append(f"{rel}:{linea}  {como} → {destino}   (esquema '{esquema}')")
+
+            for linea, como in dinamicas:
+                avisos.append(f"{rel}:{linea}  {como} con destino construido en ejecución")
+
+    return errores, avisos
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -139,8 +256,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # Segunda pasada: lo que el código HACE, no solo lo que declara. Un `@dlt.table` publica en el
+    # esquema del recurso, pero un `saveAsTable("otro.esquema.t")` o un `spark.sql("INSERT INTO
+    # ...")` dentro del cuerpo del pipeline escriben donde digan, y eso no aparece en tables.lock.
+    errores_codigo, avisos = _revisar_codigo(raiz, permitidos)
+
     lista = ", ".join(sorted(permitidos))
-    print(f"{len(declaradas)} tabla(s) declarada(s), todas dentro de: {lista}.")
+
+    if errores_codigo:
+        print(
+            f"error: {len(errores_codigo)} escritura(s) en el código apuntan fuera de: {lista}\n",
+            file=sys.stderr,
+        )
+        for e in errores_codigo:
+            print(f"    {e}", file=sys.stderr)
+        return 1
+
+    if avisos:
+        # Aviso y no error: construir el nombre en tiempo de ejecución es a veces legítimo, y no se
+        # puede saber leyendo el código. Se reporta para que se vea en el PR, que es lo único que
+        # esta compuerta puede ofrecer ahí.
+        print(f"\n{len(avisos)} escritura(s) con destino no resoluble:")
+        for a in avisos:
+            print(f"    {a}")
+        print("  No se puede saber a qué esquema van. Revísalas a mano.")
+
+    print(f"\n{len(declaradas)} tabla(s) declarada(s), todas dentro de: {lista}.")
     return 0
 
 

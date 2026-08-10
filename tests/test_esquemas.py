@@ -123,3 +123,77 @@ def test_no_confunde_dos_esquemas_con_prefijo_comun(repo: RepoFalso) -> None:
     )
 
     assert _correr(repo) == 1
+
+
+# --------------------------------------------------------------------------------------------
+# Segunda pasada: lo que el código HACE, no lo que declara
+# --------------------------------------------------------------------------------------------
+
+
+def _pipeline(repo: RepoFalso, cuerpo: str) -> None:
+    """Reemplaza el pipeline del fixture. Sin @dlt.table no declara nada: aísla el escaneo."""
+    repo.escribir("pipelines/silver/ventas.py", cuerpo)
+    _con_config(repo, 'allowed_schemas = ["ventas"]')
+
+
+def test_atrapa_un_saveastable_a_otro_esquema(repo: RepoFalso, capsys) -> None:
+    """No aparece en tables.lock: el pipeline escribe donde le digan, no donde declara."""
+    _pipeline(repo, 'df.write.saveAsTable("ej_dev_gold.finanzas.saldos")\n')
+
+    assert _correr(repo) == 1
+    assert "finanzas" in capsys.readouterr().err
+
+
+def test_atrapa_un_insert_into_por_sql(repo: RepoFalso, capsys) -> None:
+    _pipeline(repo, 'spark.sql("INSERT INTO hr.nomina SELECT * FROM ventas.pedidos")\n')
+
+    err = _correr(repo), capsys.readouterr().err
+    assert err[0] == 1
+    assert "hr" in err[1] and "INSERT INTO" in err[1]
+
+
+def test_no_se_queja_de_una_tabla_del_esquema_propio(repo: RepoFalso) -> None:
+    """Un nombre sin punto es del esquema del pipeline: no dice nada de otro esquema."""
+    _pipeline(
+        repo,
+        'df.write.saveAsTable("pedidos")\n'
+        'spark.sql("INSERT INTO pedidos VALUES (1)")\n',
+    )
+
+    assert _correr(repo) == 0
+
+
+def test_no_se_queja_de_una_escritura_en_su_propio_esquema_cualificada(repo: RepoFalso) -> None:
+    _pipeline(repo, 'df.write.saveAsTable("ej_dev_silver.ventas.pedidos")\n')
+
+    assert _correr(repo) == 0
+
+
+def test_no_se_queja_de_leer_otro_esquema(repo: RepoFalso) -> None:
+    """Leer es legítimo: es para lo que existe un lakehouse. La restricción vive en los grants."""
+    _pipeline(repo, 'df = spark.sql("SELECT * FROM ej_dev_gold.finanzas.saldos")\n')
+
+    assert _correr(repo) == 0
+
+
+def test_un_destino_dinamico_es_aviso_y_no_error(repo: RepoFalso, capsys) -> None:
+    """No se puede resolver leyendo el código, y a veces es legítimo. Se reporta, no se bloquea."""
+    _pipeline(repo, 'esq = "x"\nspark.sql(f"INSERT INTO {esq}.tabla VALUES (1)")\n')
+
+    assert _correr(repo) == 0
+    assert "no resoluble" in capsys.readouterr().out
+
+
+def test_un_saveastable_con_variable_es_aviso(repo: RepoFalso, capsys) -> None:
+    _pipeline(repo, 'destino = "otro.esquema.t"\ndf.write.saveAsTable(destino)\n')
+
+    assert _correr(repo) == 0
+    assert "no resoluble" in capsys.readouterr().out
+
+
+def test_atrapa_un_drop_table_ajeno(repo: RepoFalso, capsys) -> None:
+    """DROP es la que destruye datos, así que es la que más importa atrapar."""
+    _pipeline(repo, 'spark.sql("DROP TABLE IF EXISTS ej_prod_gold.finanzas.saldos")\n')
+
+    assert _correr(repo) == 1
+    assert "finanzas" in capsys.readouterr().err
