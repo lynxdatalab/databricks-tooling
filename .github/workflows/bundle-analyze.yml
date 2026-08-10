@@ -30,6 +30,22 @@ on:
           El default es el ejecutable que instala `lakehouse-tooling`.
         type: string
         default: "check-destructive"
+      contract-lint:
+        description: >-
+          Compuertas del repo, una por línea. Vacío = se omiten.
+
+          POR QUÉ ESTÁN AQUÍ Y NO SOLO EN EL CI. `ci` y `deploy` son workflows INDEPENDIENTES:
+          los dos se disparan por push a main y ninguno depende del otro. Un `ci` en rojo no
+          impedía desplegar, así que toda compuerta que viviera solo allá era decorativa — el
+          código llegaba al workspace igual.
+
+          Este job es `needs:` de todos los jobs de despliegue, así que fallar aquí los detiene a
+          todos. Se pasa la MISMA lista que a bundle-ci: en el PR avisa temprano, aquí bloquea.
+
+          Corren ANTES del análisis de destructivos a propósito: si el contrato no es válido, lo
+          que el análisis diga sobre él no significa nada.
+        type: string
+        default: ""
       python-version:
         type: string
         default: "3.11"
@@ -74,6 +90,12 @@ jobs:
           else
             pip install lakehouse-tooling
           fi
+
+      # La compuerta que de verdad detiene un despliegue. Va antes del análisis de destructivos:
+      # si el contrato no es válido, lo que el análisis diga sobre él no significa nada.
+      - name: Compuertas del repo
+        if: inputs.contract-lint != ''
+        run: ${{ inputs.contract-lint }}
 
       # Resolver la base es un paso aparte porque tiene tres casos y uno de ellos no es un error.
       #
