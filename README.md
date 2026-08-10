@@ -41,25 +41,42 @@ no admite expresiones —`uses: ${{ vars.ORG }}/repo/...@v1` es un error de sint
 sin resolver—, pip no expande variables dentro de un `git+https://github.com/...`, y CODEOWNERS no
 resuelve nada. Son tres literales, en tres formatos distintos.
 
-Así que mover un repo de una organización a otra es buscar el nombre a mano y confiar en no haber
-olvidado ninguno. Cuando se olvida uno, no falla al migrar: falla en la primera corrida de CI, con
-un `workflow was not found` que no menciona la organización por ningún lado.
+**Y no todos apuntan al mismo sitio.** El tooling compartido vive en la organización del proveedor
+y los repos de proyecto en la del cliente, que es el caso normal y no la excepción:
 
-La organización se declara una vez:
+| | Rige | Qué es |
+|---|---|---|
+| `github_org` | los equipos de `@org/equipo` en CODEOWNERS | quién es **dueño** de este repo |
+| `tooling_org` | el `uses:` y la dependencia `git+https` | dónde vive el **tooling** compartido |
+
+Migrar un repo de organización mueve lo primero y **no debe tocar lo segundo**. Confundirlos deja
+el CI con `workflow was not found`, un error que no menciona la organización por ningún lado.
 
 ```toml
 [tool.lakehouse-tooling]
-github_org = "mi-organizacion"
+github_org   = "org-del-cliente"
+tooling_org  = "org-del-proveedor"    # opcional
+tooling_repo = "databricks-tooling"   # opcional
 ```
 
 ```bash
-set-github-org --check                       # compuerta de CI
-set-github-org --org nueva-org               # renombra desde la org declarada
-set-github-org --org nueva-org --from vieja  # primera adopción, sin declaración previa
+set-github-org --check                                   # compuerta de CI
+set-github-org --org nueva-org                           # mueve el repo de organización
+set-github-org --org cliente --tooling-org proveedor     # los separa
+set-github-org --org nueva --from vieja                  # primera adopción
 ```
 
-No toca las acciones de terceros: `actions/checkout@v4` y `databricks/setup-cli@v1.11.0` también
-tienen forma `org/repo`, y renombrarlas rompería el CI en vez de migrarlo.
+**`tooling_org` ausente equivale a `github_org`**, y por eso `--org nueva` a secas mueve las dos
+cosas: es como se comportaban los repos escritos cuando solo había una organización, y sin ese
+default mover el tag `v1` los pondría en rojo. Separarlas hay que pedirlo explícitamente.
+
+No toca las acciones de terceros —`actions/checkout@v4` y `databricks/setup-cli@v1.11.0` también
+tienen forma `org/repo`— ni los workflows reutilizables de otro repo: la clasificación es por
+**repo referenciado**, no por la forma de la referencia.
+
+**`docs/` queda deliberadamente fuera.** Una bitácora que dice "esto se desplegó en tal
+organización" es un hecho histórico; reescribirla la convertiría en una mentira. Las referencias en
+documentación se actualizan a mano, agregando, no sustituyendo.
 
 ## Cómo se usa
 
