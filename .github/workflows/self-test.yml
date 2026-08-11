@@ -59,10 +59,17 @@ jobs:
       - name: Los ejecutables quedaron instalados
         # Si un entry point se rompe, el fallo aparecería en el CI de los consumidores como un
         # "command not found" sin relación aparente con este repo.
+        #
+        # LOS CUATRO, no los que existían el día que se escribió esto. `[project.scripts]` declara
+        # cuatro ejecutables y los cuatro se invocan desde el `contract-lint` de los repos
+        # consumidores; comprobar solo dos dejaba fuera justo a los dos más nuevos, que son los que
+        # tienen más probabilidad de tener el nombre del módulo mal escrito.
         run: |
           set -euo pipefail
           check-destructive --help > /dev/null
           gen-tables-lock --help > /dev/null
+          set-github-org --help > /dev/null
+          check-schemas --help > /dev/null
 
   workflows:
     name: los workflows son YAML válido
