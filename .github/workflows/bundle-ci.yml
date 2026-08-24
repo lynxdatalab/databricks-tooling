@@ -38,6 +38,15 @@ on:
         description: Corre `ruff check .`. Se puede apagar en un repo que aún no está limpio.
         type: boolean
         default: true
+      run-validate:
+        description: >-
+          Corre `databricks bundle validate` contra los targets. Apagarlo sirve para un repo que
+          usa el resto del CI pero NO está atado a un workspace — el caso del molde genérico, que
+          no tiene (ni debe tener) Environments con las variables de nadie: sin ellos, `validate`
+          falla con "no existe una variable 'NOTIFICATION_EMAIL'" y deja el CI del molde en rojo
+          permanente, aunque su lint y sus pruebas estén bien.
+        type: boolean
+        default: true
       contract-lint:
         description: >-
           Comando del lint de contrato del repo. Vacío = se omite. Se ejecuta ANTES de bundle
@@ -175,6 +184,7 @@ jobs:
   bundle:
     name: validate (${{ matrix.target }})
     needs: estatico
+    if: inputs.run-validate
     runs-on: ubuntu-latest
     # Toma HOST y CLIENT_ID del environment. Se declara aunque no se despliegue porque es de donde
     # salen las variables y porque el claim `sub` del token OIDC tiene que coincidir con la
