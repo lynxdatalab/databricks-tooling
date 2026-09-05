@@ -30,6 +30,13 @@ on:
         description: Target del bundle. Debe existir un GitHub Environment con el mismo nombre.
         type: string
         required: true
+      permitir-prod:
+        description: >-
+          Desplegar a producción DESDE EL REPO DEL PROYECTO. Falso por defecto y así debe quedarse:
+          el diseño manda que prod salga de un repo de despliegue dedicado, con el service
+          principal de procesamiento. Ponerlo en true es una decisión, no un parámetro.
+        type: boolean
+        default: false
       python-version:
         type: string
         default: "3.11"
@@ -116,6 +123,24 @@ jobs:
       # federation policy del service principal canjea por acceso.
 
     steps:
+      # Producción no sale del repo del proyecto. La compuerta REAL es la de identidad —Terraform
+      # no le crea federation policy a prod, así que el token OIDC no se canjea— pero esa compuerta
+      # vive en otro repo y se abre sola si alguien agrega "prod" a la lista de ambientes federados.
+      # Esto la duplica donde sí se ve, y falla con el motivo escrito en vez de con TOKEN_INVALID.
+      #
+      # El camino de prod es un repo de despliegue dedicado, que promueve un tag `qa-ok-*` con el
+      # service principal de procesamiento. Desplegar como otra identidad manda a DABs a una carpeta
+      # vacía —el root_path lleva el usuario actual— y CREA TODO DE NUEVO: ya costó once pipelines
+      # huérfanos en producción.
+      - name: Producción no se despliega desde aquí
+        if: ${{ contains(fromJSON('["prod","production"]'), inputs.target) && !inputs.permitir-prod }}
+        run: |
+          echo "::error::target='${{ inputs.target }}' desde el repo del proyecto." \
+               "Producción se despliega desde el repo de despliegue dedicado, con el service" \
+               "principal de procesamiento. Si de verdad este proyecto tiene que desplegar prod" \
+               "desde aquí, es una decisión: pásale permitir-prod: true y déjalo escrito."
+          exit 1
+
       - uses: actions/checkout@v4
 
       # Fijo, no @main: es la misma regla que este repo le impone a sus consumidores.
