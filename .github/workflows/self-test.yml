@@ -80,6 +80,13 @@ jobs:
       - name: Parsear cada workflow y verificar que declara workflow_call
         # Un error de sintaxis aquí no se descubre al mezclar: se descubre cuando un repo
         # consumidor lo llama y GitHub le contesta con un error que apunta a ESTE archivo.
+        #
+        # Y ADEMÁS: claves DUPLICADAS. `yaml.safe_load` acepta una clave repetida sin decir nada —
+        # la última pisa a la primera. El 05/09/2026 una edición mal hecha duplicó el job
+        # `workflows` entero en este mismo archivo, y el parseo siguió diciendo «YAML válido · 2
+        # jobs»: el duplicado se había comido a su gemelo en silencio. En un workflow eso significa
+        # que la mitad de lo que crees que corre no existe. Se comprueba con un loader propio
+        # porque el de la librería, por diseño, no lo considera un error.
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -88,10 +95,31 @@ jobs:
 
           import yaml
 
+
+          class SinDuplicados(yaml.SafeLoader):
+              """Igual que SafeLoader, pero una clave repetida es un error y no un silencio."""
+
+
+          def _sin_duplicados(loader, nodo, deep=False):
+              mapa = {}
+              for clave_nodo, valor_nodo in nodo.value:
+                  clave = loader.construct_object(clave_nodo, deep=deep)
+                  if clave in mapa:
+                      raise yaml.constructor.ConstructorError(
+                          None, None, f"clave duplicada: {clave!r}", clave_nodo.start_mark
+                      )
+                  mapa[clave] = loader.construct_object(valor_nodo, deep=deep)
+              return mapa
+
+
+          SinDuplicados.add_constructor(
+              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _sin_duplicados
+          )
+
           fallos = []
           for archivo in sorted(Path(".github/workflows").glob("*.yml")):
               try:
-                  datos = yaml.safe_load(archivo.read_text(encoding="utf-8"))
+                  datos = yaml.load(archivo.read_text(encoding="utf-8"), Loader=SinDuplicados)
               except yaml.YAMLError as exc:
                   fallos.append(f"{archivo}: YAML inválido: {exc}")
                   continue
@@ -115,16 +143,28 @@ jobs:
         # `Producción no se despliega desde aquí = failure`, y checkout, setup-cli, bundle validate
         # y bundle deploy quedaron TODOS en `skipped`: no llegó a tocar un bundle.
         #
-        # Esa corrida no se puede dejar puesta como check permanente, y conviene decir por qué en
-        # vez de dejarlo a la imaginación: `continue-on-error` **no es válido** en un job que llama
-        # a un workflow reutilizable —GitHub rechaza el archivo entero, no el job—, así que no hay
-        # forma de expresar «esto tiene que fallar» y seguir en verde. Un check permanentemente rojo
-        # es peor que ninguno: entrena a ignorar los rojos.
+        # Esa corrida no se puede dejar puesta como check permanente: `continue-on-error` NO es
+        # válido en un job que llama a un workflow reutilizable —GitHub rechaza el archivo entero,
+        # no el job—, así que no hay forma de expresar «esto tiene que fallar» y seguir en verde. Y
+        # un check permanentemente rojo entrena a ignorar los rojos.
         #
-        # Lo que sí se puede vigilar en verde es que la guarda no DESAPAREZCA ni se estreche, que es
-        # como se pierden las compuertas: nadie las borra a propósito, se van en un refactor. Este
-        # paso falla si el step ya no está, si su condición deja de cubrir `prod` o `production`, si
-        # deja de mirar `permitir-prod`, o si deja de salir con un código distinto de cero.
+        # QUÉ VIGILA, Y QUÉ NO. Vigila la FORMA de la guarda, no su semántica: no ejecuta nada, así
+        # que no puede saber si bloquea. La primera versión de este parser comprobaba que el paso
+        # existiera, fuera el primero, su condición mencionara tres literales y su `run` contuviera
+        # la subcadena `exit 1`. La revisión independiente del cierre encontró SEIS formas de
+        # romper la guarda dejándolo en VERDE:
+        #
+        #   if: ${{ false && contains(...) }}        nunca corre; los tres literales siguen ahí
+        #   continue-on-error: true en el paso       falla y el job SIGUE hasta el deploy
+        #   exit 0 real, con exit 1 dentro de un echo    la subcadena estaba, la salida era 0
+        #   condición negada: !contains(...)         bloquea dev y qa, deja pasar prod
+        #   inputs.python-version en vez de target   mira el input equivocado
+        #   exit 1 dentro de un if inalcanzable      nunca se ejecuta
+        #
+        # De ahí la forma de abajo: la condición se compara COMPLETA y literal, no por subcadenas,
+        # y el `run` tiene que TERMINAR en `exit 1`. Eso hace el check deliberadamente frágil ante
+        # cualquier edición de la guarda — que es lo que se quiere: cambiarla tiene que obligarte a
+        # venir aquí y decidirlo, no colarse en un refactor.
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -134,48 +174,74 @@ jobs:
           import yaml
 
           ARCHIVO = Path(".github/workflows/bundle-deploy.yml")
+          JOB = "deploy"
           PASO = "Producción no se despliega desde aquí"
+          CONDICION = (
+              "${{ contains(fromJSON('[\"prod\",\"production\"]'), inputs.target)"
+              " && !inputs.permitir-prod }}"
+          )
 
+          fallos: list[str] = []
           datos = yaml.safe_load(ARCHIVO.read_text(encoding="utf-8"))
-          pasos = datos["jobs"]["deploy"]["steps"]
+          jobs = datos.get("jobs") or {}
+
+          if JOB not in jobs:
+              # Sin esto, renombrar el job reventaba con un KeyError crudo que no menciona la
+              # guarda: quien lo viera en Actions no sabría de qué le hablan.
+              print(
+                  f"::error::{ARCHIVO} ya no tiene el job `{JOB}`, donde vive la guarda de "
+                  f"producción. Jobs que hay: {sorted(jobs)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          pasos = jobs[JOB].get("steps") or []
           guarda = next((p for p in pasos if p.get("name") == PASO), None)
 
           if guarda is None:
-              print(
-                  f"::error::{ARCHIVO} ya no tiene el paso «{PASO}». Es la guarda que impide "
-                  "desplegar producción desde el repo del proyecto, y se vio bloquear en la "
-                  "corrida 33982181990. Si se quitó a propósito, quita también este check y "
-                  "escribe por qué.",
-                  file=sys.stderr,
+              fallos.append(
+                  f"{ARCHIVO} ya no tiene el paso «{PASO}». Es la guarda que impide desplegar "
+                  "producción desde el repo del proyecto, y se vio bloquear en la corrida "
+                  "33982181990. Si se quitó a propósito, quita también este check y di por qué."
               )
+          else:
+              if pasos.index(guarda) != 0:
+                  fallos.append(
+                      "la guarda ya no es el PRIMER paso de `deploy`. Tiene que correr antes del "
+                      "checkout y de cualquier credencial: es lo que hace que rechazar prod no "
+                      "llegue a tocar un bundle."
+                  )
+
+              condicion = " ".join(str(guarda.get("if", "")).split())
+              if condicion != " ".join(CONDICION.split()):
+                  fallos.append(
+                      "la condición de la guarda cambió. Se compara COMPLETA y no por subcadenas, "
+                      "porque `false && ...`, una negación o mirar otro input dejan los literales "
+                      "en su sitio y la guarda muerta. "
+                      f"Esperada: {CONDICION} -- Está: {condicion} -- "
+                      "Si el cambio es a propósito, actualiza CONDICION en este check."
+                  )
+
+              if guarda.get("continue-on-error"):
+                  fallos.append(
+                      "la guarda lleva `continue-on-error`, así que falla y el job SIGUE hasta el "
+                      "deploy. Es peor que no tenerla: avisa y deja pasar."
+                  )
+
+              lineas = [x.strip() for x in str(guarda.get("run", "")).splitlines() if x.strip()]
+              ultima = lineas[-1] if lineas else "(vacío)"
+              if ultima != "exit 1":
+                  fallos.append(
+                      "el `run` de la guarda no TERMINA en `exit 1`. Se comprueba la última línea "
+                      "y no que la subcadena aparezca: un `exit 1` dentro de un `echo` o de un "
+                      f"`if` inalcanzable deja el paso en verde. Última línea: {ultima}"
+                  )
+
+          if fallos:
+              for f in fallos:
+                  print(f"::error::{f}", file=sys.stderr)
               sys.exit(1)
 
-          if pasos.index(guarda) != 0:
-              print(
-                  f"::error::la guarda ya no es el PRIMER paso de `deploy`. Tiene que correr antes "
-                  "del checkout y de cualquier credencial: es lo que hace que rechazar prod no "
-                  "llegue a tocar un bundle.",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          condicion = str(guarda.get("if", ""))
-          faltan = [t for t in ('"prod"', '"production"', "permitir-prod") if t not in condicion]
-          if faltan:
-              print(
-                  f"::error::la condición de la guarda dejó de mencionar {faltan}. Condición "
-                  f"actual: {condicion}",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          if "exit 1" not in str(guarda.get("run", "")):
-              print(
-                  "::error::la guarda ya no sale con código distinto de cero: avisaría sin "
-                  "bloquear, que es la peor de las dos opciones.",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          print(f"ok  la guarda está, es el primer paso, cubre {condicion.strip()} y sale con 1")
+          print("ok  la guarda está, es el primer paso, su condición es la esperada,")
+          print("    no lleva continue-on-error, y su run termina en exit 1")
           PY
