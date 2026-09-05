@@ -154,7 +154,7 @@ jobs:
         # la subcadena `exit 1`. La revisión independiente del cierre encontró SEIS formas de
         # romper la guarda dejándolo en VERDE:
         #
-        #   if: ${{ false && contains(...) }}        nunca corre; los tres literales siguen ahí
+        #   if: <expr> false && contains(...)       nunca corre; los tres literales siguen ahí
         #   continue-on-error: true en el paso       falla y el job SIGUE hasta el deploy
         #   exit 0 real, con exit 1 dentro de un echo    la subcadena estaba, la salida era 0
         #   condición negada: !contains(...)         bloquea dev y qa, deja pasar prod
@@ -176,9 +176,18 @@ jobs:
           ARCHIVO = Path(".github/workflows/bundle-deploy.yml")
           JOB = "deploy"
           PASO = "Producción no se despliega desde aquí"
+          # La apertura de expresión va PARTIDA a propósito, y no es cosmético: GitHub interpola las
+          # expresiones dentro de `run:` ANTES de ejecutar el shell, comentarios incluidos. Escribir
+          # la condición entera aquí hace que GitHub intente evaluar `inputs.target` en un contexto
+          # donde no existe, y rechaza EL ARCHIVO COMPLETO — el self-test muere sin correr ningún
+          # job, con el mismo «workflow file issue» que no dice la causa. Ya pasó dos veces hoy.
+          ABRE = "$" + "{{ "
+          CIERRA = " }}"
           CONDICION = (
-              "${{ contains(fromJSON('[\"prod\",\"production\"]'), inputs.target)"
-              " && !inputs.permitir-prod }}"
+              ABRE
+              + "contains(fromJSON('[\"prod\",\"production\"]'), inputs.target)"
+              + " && !inputs.permitir-prod"
+              + CIERRA
           )
 
           fallos: list[str] = []
