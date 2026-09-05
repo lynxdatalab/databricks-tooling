@@ -1,0 +1,18 @@
+# TEMPORAL — se borra en este mismo PR. Existe para VER bloquear la guarda de producción de
+# bundle-deploy.yml, que hasta hoy nadie había visto actuar. La corrida roja que produce es la
+# evidencia; el enlace queda en el cuerpo del PR y en el pendiente MF-070.
+name: zz-temporal-ver-bloquear
+
+on:
+  push:
+    branches: [test/ver-bloquear-la-guarda-de-prod]
+
+permissions:
+  contents: read
+
+jobs:
+  intentar_prod:
+    uses: ./.github/workflows/bundle-deploy.yml
+    with:
+      target: prod
+      dry-run: true
