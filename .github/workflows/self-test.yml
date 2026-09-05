@@ -106,3 +106,76 @@ jobs:
               print("\n".join(fallos), file=sys.stderr)
               sys.exit(1)
           PY
+
+      - name: La guarda de producción sigue en su sitio y sigue cubriendo prod
+        # POR QUÉ ESTE CHECK ES UN PARSER Y NO UNA CORRIDA QUE FALLE.
+        #
+        # La guarda se VIO BLOQUEAR de verdad el 05/09/2026, y la evidencia es esta corrida:
+        #   https://github.com/lynxdatalab/databricks-tooling/actions/runs/33982181990
+        # `Producción no se despliega desde aquí = failure`, y checkout, setup-cli, bundle validate
+        # y bundle deploy quedaron TODOS en `skipped`: no llegó a tocar un bundle.
+        #
+        # Esa corrida no se puede dejar puesta como check permanente, y conviene decir por qué en
+        # vez de dejarlo a la imaginación: `continue-on-error` **no es válido** en un job que llama
+        # a un workflow reutilizable —GitHub rechaza el archivo entero, no el job—, así que no hay
+        # forma de expresar «esto tiene que fallar» y seguir en verde. Un check permanentemente rojo
+        # es peor que ninguno: entrena a ignorar los rojos.
+        #
+        # Lo que sí se puede vigilar en verde es que la guarda no DESAPAREZCA ni se estreche, que es
+        # como se pierden las compuertas: nadie las borra a propósito, se van en un refactor. Este
+        # paso falla si el step ya no está, si su condición deja de cubrir `prod` o `production`, si
+        # deja de mirar `permitir-prod`, o si deja de salir con un código distinto de cero.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          ARCHIVO = Path(".github/workflows/bundle-deploy.yml")
+          PASO = "Producción no se despliega desde aquí"
+
+          datos = yaml.safe_load(ARCHIVO.read_text(encoding="utf-8"))
+          pasos = datos["jobs"]["deploy"]["steps"]
+          guarda = next((p for p in pasos if p.get("name") == PASO), None)
+
+          if guarda is None:
+              print(
+                  f"::error::{ARCHIVO} ya no tiene el paso «{PASO}». Es la guarda que impide "
+                  "desplegar producción desde el repo del proyecto, y se vio bloquear en la "
+                  "corrida 33982181990. Si se quitó a propósito, quita también este check y "
+                  "escribe por qué.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if pasos.index(guarda) != 0:
+              print(
+                  f"::error::la guarda ya no es el PRIMER paso de `deploy`. Tiene que correr antes "
+                  "del checkout y de cualquier credencial: es lo que hace que rechazar prod no "
+                  "llegue a tocar un bundle.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          condicion = str(guarda.get("if", ""))
+          faltan = [t for t in ('"prod"', '"production"', "permitir-prod") if t not in condicion]
+          if faltan:
+              print(
+                  f"::error::la condición de la guarda dejó de mencionar {faltan}. Condición "
+                  f"actual: {condicion}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if "exit 1" not in str(guarda.get("run", "")):
+              print(
+                  "::error::la guarda ya no sale con código distinto de cero: avisaría sin "
+                  "bloquear, que es la peor de las dos opciones.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(f"ok  la guarda está, es el primer paso, cubre {condicion.strip()} y sale con 1")
+          PY
