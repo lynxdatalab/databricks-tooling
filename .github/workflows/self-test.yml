@@ -71,6 +71,52 @@ jobs:
           set-github-org --help > /dev/null
           check-schemas --help > /dev/null
 
+  # ── La guarda de producción, EJERCITADA ──────────────────────────────────
+  #
+  # `bundle-deploy.yml` trae desde el 04/09/2026 una guarda que rechaza `target: prod` cuando el
+  # llamador no pasa `permitir-prod`. Existía, estaba razonada, y **nadie la había visto bloquear**:
+  # este self-test no la ejercitaba y ningún consumidor pasa `prod`. Un check que no se ha visto
+  # fallar no es un check — es una intención.
+  #
+  # CÓMO SE PRUEBA ALGO QUE TIENE QUE FALLAR. Se llama al workflow con `target: prod` y
+  # `continue-on-error`, y un job aparte afirma que el resultado fue `failure`. La afirmación va en
+  # OTRO job a propósito: si estuviera dentro, el fallo de la guarda se tragaría la afirmación y el
+  # verde no significaría nada.
+  #
+  # POR QUÉ NO LLEGA A DESPLEGAR NADA. El paso de la guarda es el PRIMERO del job, antes del
+  # `checkout` y de cualquier credencial: sale con `exit 1` sin haber tocado un bundle. Y si alguien
+  # borrara la guarda, el job seguiría fallando —no hay Databricks al que desplegar desde este
+  # repo— pero fallaría por otra razón, así que el mensaje también se comprueba.
+  guarda_de_prod:
+    name: la guarda de prod tiene que rechazar esto
+    uses: ./.github/workflows/bundle-deploy.yml
+    with:
+      target: prod
+      # dry-run además de la guarda: cinturón y tirantes. Si algún día la guarda desaparece, esto
+      # evita que la prueba se convierta en un despliegue.
+      dry-run: true
+    continue-on-error: true
+
+  guarda_de_prod_bloqueo:
+    name: ...y la vimos rechazarlo
+    needs: guarda_de_prod
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: El resultado de la llamada tiene que ser failure
+        env:
+          RESULTADO: ${{ needs.guarda_de_prod.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$RESULTADO" == "failure" ]]; then
+            echo "La guarda rechazó target: prod. Es lo que tiene que pasar."
+            exit 0
+          fi
+          echo "::error::La guarda NO rechazó target: prod (resultado: $RESULTADO)." \
+               "O se borró, o su condición dejó de casar. Ver bundle-deploy.yml," \
+               "paso «Producción no se despliega desde aquí»."
+          exit 1
+
   workflows:
     name: los workflows son YAML válido
     runs-on: ubuntu-latest
