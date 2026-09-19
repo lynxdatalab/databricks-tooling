@@ -98,13 +98,28 @@ on:
           puede pasar aquí la ruta de su propio script.
         type: string
         default: "check-destructive"
+      agrupar-jobs:
+        description: >-
+          Corre el análisis de destructivos DENTRO del job de lint + pruebas y valida todos los
+          targets en UN solo job, en vez de un job por target. Mismas comprobaciones, menos jobs.
+
+          Existe por el cupo de minutos de Actions: GitHub cobra cada job redondeado al minuto,
+          y un `bundle validate` tarda ~10 s. Con tres targets y el análisis de destructivos
+          aparte, un PR pagaba 7 minutos por ~3 de trabajo real. Agrupado, paga 4. Medido en
+          mainland-farms-refined en septiembre de 2026: ~55 % de sus minutos eran redondeo.
+
+          Lo que se pierde: el resultado por target deja de verse como un check separado; el log
+          del job lo agrupa por target y, si falla, dice cuál. Default false para no cambiar a
+          quien no lo pida.
+        type: boolean
+        default: false
 
 jobs:
   destructivos:
     name: cambios destructivos
     # Solo en PRs: en un push a main el análisis lo hace el job `analizar` del deploy, que además
     # publica el resumen que ven los revisores de qa y prod.
-    if: ${{ github.event_name == 'pull_request' && inputs.destructive-check != '' }}
+    if: ${{ github.event_name == 'pull_request' && inputs.destructive-check != '' && !inputs.agrupar-jobs }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +163,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Con `agrupar-jobs` el análisis de destructivos corre aquí y necesita la historia (ver
+          # el job `destructivos`). Como texto: `0` a secas es falso en una expresión y daría 1.
+          fetch-depth: ${{ inputs.agrupar-jobs && '0' || '1' }}
 
       - uses: actions/setup-python@v5
         with:
@@ -163,6 +182,19 @@ jobs:
           else
             pip install ruff pytest lakehouse-tooling
           fi
+
+      - name: Analizar cambios destructivos contra la rama base
+        # El mismo paso que el job `destructivos`, cuando se piden los jobs agrupados.
+        if: ${{ inputs.agrupar-jobs && github.event_name == 'pull_request' && inputs.destructive-check != '' }}
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          ${{ inputs.destructive-check }} \
+            --base "origin/${{ github.event.pull_request.base.ref }}" \
+            --mode pr \
+            --labels "$PR_LABELS" \
+            --summary-file "$GITHUB_STEP_SUMMARY"
 
       - name: ruff
         if: inputs.run-lint
@@ -193,7 +225,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(inputs.targets) }}
+        # Agrupado: un solo job, `todos`, que recorre los targets en el paso de validate.
+        target: ${{ inputs.agrupar-jobs && fromJSON('["todos"]') || fromJSON(inputs.targets) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -254,4 +287,23 @@ jobs:
           # Sin DATABRICKS_CLIENT_SECRET: la CLI usa el token OIDC efímero que emite GitHub y que
           # la federation policy del service principal canjea por acceso. No hay ningún secreto
           # de larga vida en el repo ni en los settings.
-        run: databricks bundle validate -t ${{ matrix.target }}
+          TARGET: ${{ matrix.target }}
+          TARGETS: ${{ inputs.targets }}
+        # Con `todos` se validan TODOS los targets aunque uno falle —como hacía la matriz con
+        # fail-fast: false— y al final se dice cuáles fallaron.
+        run: |
+          set -uo pipefail
+          if [ "$TARGET" != "todos" ]; then
+            databricks bundle validate -t "$TARGET"
+            exit $?
+          fi
+          fallidos=""
+          for t in $(python3 -c 'import json, os; print(" ".join(json.loads(os.environ["TARGETS"])))'); do
+            echo "::group::bundle validate -t $t"
+            if ! databricks bundle validate -t "$t"; then fallidos="$fallidos $t"; fi
+            echo "::endgroup::"
+          done
+          if [ -n "$fallidos" ]; then
+            echo "::error::bundle validate falló en:$fallidos"
+            exit 1
+          fi
